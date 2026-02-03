@@ -1,0 +1,4 @@
+*.pth
+*.csv
+/speech_data
+/__pycache__
