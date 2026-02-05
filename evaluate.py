@@ -232,7 +232,7 @@ def parse_args():
     parser.add_argument(
         '--model', '-m',
         type=str,
-        default='/mnt/chensenda/codes/sound/cnn/saved_2/ssl_model_reg_60.pth',
+        default='/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_middle_ddp/ssl_model_ddp_345.pth',
         help='模型权重文件路径 (默认: ssl_model_reg_35.pth)'
     )
     

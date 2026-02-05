@@ -23,11 +23,11 @@ from dataset_sim import DynamicRoomSimulator
 
 def main():
     AUDIO_DIR = "./speech_data/LibriSpeech/dev-clean" # 确保路径正确
-    BATCH_SIZE = 512
-    LR = 0.0005
+    BATCH_SIZE = 256
+    LR = 0.001
     EPOCHS = 100
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SAVE_DIR = "saved_2_after60stpes_512batchsize"
+    SAVE_DIR = "saved_2_after60stpes_addrealnoise"
     
     # 确保保存目录存在
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -41,14 +41,14 @@ def main():
     train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 
     # 2. 模型
-    model = RawAudioSSLNet(num_mics=4, input_len=2048).to(DEVICE)
-    model.load_state_dict(torch.load("/mnt/chensenda/codes/sound/cnn/saved_2/ssl_model_reg_60_best.pth"))
+    model = RawAudioSSLNet().to(DEVICE)
+    model.load_state_dict(torch.load("/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_2_after60stpes_addrealnoise/ssl_model_reg_5.pth"))
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     
-    # 学习率调度: 从1e-3线性下降到5e-4，在0-50 epoch内完成
-    LR_START = 5e-4
+    # 学习率调度: 从1e-3线性下降到1e-4，在0-50 epoch内完成
+    LR_START = 1e-3
     LR_END = 1e-4
-    LR_DECAY_EPOCHS = 50
+    LR_DECAY_EPOCHS = 100
     
     def lr_lambda(epoch):
         if epoch < LR_DECAY_EPOCHS:

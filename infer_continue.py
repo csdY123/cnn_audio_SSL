@@ -313,7 +313,9 @@ class SSLInference:
         audio_paths: list[str],
         hop_seconds: float = 0.1,
         sample_rate: int = 16000,
-        dtype: np.dtype = np.int16
+        dtype: np.dtype = np.int16,
+        vad_threshold: float = 1e-5,
+        smooth_alpha: float = 0.3
     ) -> dict:
         """
         Perform continuous inference on audio files with sliding window
@@ -323,14 +325,21 @@ class SSLInference:
             hop_seconds: Time interval between inferences (in seconds)
             sample_rate: Audio sample rate
             dtype: PCM data type (only for PCM files)
+            vad_threshold: Energy threshold for Voice Activity Detection.
+                           Frames below this threshold will use the previous angle.
+            smooth_alpha: Exponential smoothing factor (0-1). 
+                          Lower values = smoother but more latency.
+                          Set to 1.0 to disable smoothing.
         
         Returns:
             Dictionary containing:
             {
                 'timestamps': List of timestamps (seconds),
                 'angles': List of azimuth angles (degrees),
+                'angles_raw': List of raw angles before smoothing,
                 'sin_values': List of sin values,
-                'cos_values': List of cos values
+                'cos_values': List of cos values,
+                'vad_flags': List of VAD flags (True = speech detected)
             }
         """
         if len(audio_paths) != 4:
@@ -363,15 +372,25 @@ class SSLInference:
         print(f"[INFO] Window size: {self.sample_length} samples ({self.sample_length/sample_rate*1000:.1f}ms)")
         print(f"[INFO] Hop size: {hop_samples} samples ({hop_seconds*1000:.1f}ms)")
         print(f"[INFO] Total windows: {num_windows}")
+        print(f"[INFO] VAD threshold: {vad_threshold:.2e}")
+        print(f"[INFO] Smoothing alpha: {smooth_alpha:.2f}")
         
         # Perform sliding window inference
         timestamps = []
         angles = []
+        angles_raw = []
         sin_values = []
         cos_values = []
+        vad_flags = []
         
         # Stack audio channels [4, N]
         multi_ch = np.stack(audio_channels, axis=0)
+        
+        # Initialize smoothing state
+        # Note: Will be properly initialized on first valid frame (see below)
+        smoothed_sin = None  # None indicates "not yet initialized"
+        smoothed_cos = None
+        last_valid_angle = 0.0
         
         for i in range(num_windows):
             start = i * hop_samples
@@ -379,6 +398,13 @@ class SSLInference:
             
             # Extract window
             window = multi_ch[:, start:end]
+            
+            # -----------------------------------------------------------
+            # VAD: Voice Activity Detection based on energy threshold
+            # Skip inference for silent frames to avoid jitter
+            # -----------------------------------------------------------
+            frame_energy = np.mean(window ** 2)
+            is_speech = frame_energy > vad_threshold
             
             # Normalize (preserve ILD)
             max_amp = np.max(np.abs(window))
@@ -395,25 +421,57 @@ class SSLInference:
                 sin_val = output[0, 0].item()
                 cos_val = output[0, 1].item()
             
-            angle_deg = sincos_to_degree(sin_val, cos_val)
+            raw_angle_deg = sincos_to_degree(sin_val, cos_val)
+            
+            # -----------------------------------------------------------
+            # Apply VAD: only update angle if speech is detected
+            # -----------------------------------------------------------
+            if is_speech:
+                # FIX: Initialize smoothing state with first valid frame
+                # This prevents the "cold start" ramp-up from 0 degrees
+                if smoothed_sin is None or smoothed_cos is None:
+                    # First valid frame: initialize with current prediction (no smoothing)
+                    smoothed_sin = sin_val
+                    smoothed_cos = cos_val
+                else:
+                    # Subsequent frames: apply exponential smoothing
+                    smoothed_sin = smooth_alpha * sin_val + (1 - smooth_alpha) * smoothed_sin
+                    smoothed_cos = smooth_alpha * cos_val + (1 - smooth_alpha) * smoothed_cos
+                
+                # Normalize the smoothed vector (important for atan2)
+                norm = np.sqrt(smoothed_sin**2 + smoothed_cos**2)
+                if norm > 1e-6:
+                    smoothed_sin /= norm
+                    smoothed_cos /= norm
+                
+                final_angle = sincos_to_degree(smoothed_sin, smoothed_cos)
+                last_valid_angle = final_angle
+            else:
+                # Keep the last valid angle during silence
+                final_angle = last_valid_angle
             
             # Calculate timestamp (center of window)
             timestamp = (start + self.sample_length / 2) / sample_rate
             
             timestamps.append(timestamp)
-            angles.append(angle_deg)
+            angles.append(final_angle)
+            angles_raw.append(raw_angle_deg)
             sin_values.append(sin_val)
             cos_values.append(cos_val)
+            vad_flags.append(is_speech)
             
             # Progress indicator
             if (i + 1) % 50 == 0 or i == num_windows - 1:
-                print(f"[INFO] Progress: {i+1}/{num_windows} ({(i+1)/num_windows*100:.1f}%)")
+                vad_ratio = sum(vad_flags) / len(vad_flags) * 100
+                print(f"[INFO] Progress: {i+1}/{num_windows} ({(i+1)/num_windows*100:.1f}%) | VAD: {vad_ratio:.1f}%")
         
         return {
             'timestamps': timestamps,
             'angles': angles,
+            'angles_raw': angles_raw,
             'sin_values': sin_values,
-            'cos_values': cos_values
+            'cos_values': cos_values,
+            'vad_flags': vad_flags
         }
 
 
@@ -485,8 +543,8 @@ def visualize_results(
     ax2 = fig.add_subplot(1, 2, 2, projection='polar')
     ax2.set_facecolor('#1a1a2e')
     
-    # Convert degrees to radians (adjust for polar coordinate: 0° = North/Up)
-    angles_rad = np.deg2rad(90 - np.array(angles))  # Rotate so 0° is at top
+    # Convert degrees to radians (no extra rotation needed since we set theta_zero_location='N')
+    angles_rad = np.deg2rad(np.array(angles))
     
     # Create time-based alpha for trail effect
     num_points = len(timestamps)
@@ -500,25 +558,33 @@ def visualize_results(
             edgecolors='white', linewidths=0.2
         )
     
-    # Plot current position (last point) with emphasis
+    # Plot mean angle with arrow
     if len(angles) > 0:
-        current_angle_rad = angles_rad[-1]
+        # Calculate mean angle using circular mean (to handle 0/360 wrap-around)
+        sin_mean = np.mean(np.sin(angles_rad))
+        cos_mean = np.mean(np.cos(angles_rad))
+        mean_angle_rad = np.arctan2(sin_mean, cos_mean)
+        if mean_angle_rad < 0:
+            mean_angle_rad += 2 * np.pi
+        mean_angle_deg = np.rad2deg(mean_angle_rad)
+        
+        # Draw arrow pointing to mean angle
         ax2.annotate(
-            '', xy=(current_angle_rad, 1.0), xytext=(0, 0),
+            '', xy=(mean_angle_rad, 1.0), xytext=(0, 0),
             arrowprops=dict(
                 arrowstyle='->', color='#FF5555',
                 lw=2.5, mutation_scale=15
             )
         )
         ax2.scatter(
-            current_angle_rad, 1.0,
+            mean_angle_rad, 1.0,
             c='#FF5555', s=150, marker='o',
             edgecolors='white', linewidths=2, zorder=10
         )
-        # Add angle label
+        # Add mean angle label
         ax2.annotate(
-            f'{angles[-1]:.1f}°',
-            xy=(current_angle_rad, 1.15),
+            f'Mean: {mean_angle_deg:.1f}°',
+            xy=(mean_angle_rad, 1.15),
             fontsize=12, fontweight='bold', color='#FF5555',
             ha='center', va='center'
         )
@@ -533,13 +599,13 @@ def visualize_results(
         ['0°', '45°', '90°', '135°', '180°', '225°', '270°', '315°'],
         fontsize=10, color='#AAAAAA'
     )
-    ax2.set_title('Polar View (Current Direction)', fontsize=12, color='#00DDFF', pad=20)
+    ax2.set_title('Polar View (Mean Direction)', fontsize=12, color='#00DDFF', pad=20)
     ax2.grid(True, alpha=0.3, linestyle='--', color='#444444')
     
-    # Add direction labels
+    # Add direction labels (using direct degrees since theta_zero_location='N' is set)
     directions = {'N': 0, 'E': 90, 'S': 180, 'W': 270}
     for name, deg in directions.items():
-        rad = np.deg2rad(90 - deg)
+        rad = np.deg2rad(deg)
         ax2.annotate(
             name, xy=(rad, 1.45),
             fontsize=11, fontweight='bold', color='#00FFAA',
@@ -637,7 +703,7 @@ def visualize_animated(
         
         # Update polar plot
         current_angle = a_data[-1]
-        current_rad = np.deg2rad(90 - current_angle)
+        current_rad = np.deg2rad(current_angle)
         scatter_polar.set_offsets([[current_rad, 1.0]])
         
         # Update arrow
@@ -700,7 +766,7 @@ Examples:
     parser.add_argument(
         '--model', '-m',
         type=str,
-        default='/mnt/chensenda/codes/sound/cnn/saved_2/ssl_model_reg_60_best.pth',
+        default='/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_middle_ddp/ssl_model_ddp_345.pth',
         help='Model weights file path'
     )
     
@@ -746,6 +812,26 @@ Examples:
         help='Do not display the plot (useful when only saving)'
     )
     
+    parser.add_argument(
+        '--vad-threshold',
+        type=float,
+        default=1e-5,
+        help='VAD energy threshold. Frames below this are treated as silence (default: 1e-5)'
+    )
+    
+    parser.add_argument(
+        '--smooth-alpha',
+        type=float,
+        default=0.3,
+        help='Exponential smoothing factor (0-1). Lower = smoother but more latency. 1.0 = no smoothing (default: 0.3)'
+    )
+    
+    parser.add_argument(
+        '--show-raw',
+        action='store_true',
+        help='Also show raw (unsmoothed) angles in the visualization'
+    )
+    
     return parser.parse_args()
 
 
@@ -782,19 +868,38 @@ def main():
     result = inference.infer_continuous(
         args.audio_files,
         hop_seconds=args.hop,
-        dtype=dtype
+        dtype=dtype,
+        vad_threshold=args.vad_threshold,
+        smooth_alpha=args.smooth_alpha
     )
     
     print("-" * 60)
     
     # Print statistics
     angles = result['angles']
-    print("[Statistics]")
+    angles_raw = result.get('angles_raw', angles)
+    vad_flags = result.get('vad_flags', [True] * len(angles))
+    
+    # Calculate circular mean (proper for angles)
+    sin_mean = np.mean([np.sin(np.deg2rad(a)) for a in angles])
+    cos_mean = np.mean([np.cos(np.deg2rad(a)) for a in angles])
+    circular_mean = np.rad2deg(np.arctan2(sin_mean, cos_mean))
+    if circular_mean < 0:
+        circular_mean += 360
+    
+    print("[Statistics - Smoothed Angles]")
     print(f"  Total inferences: {len(angles)}")
-    print(f"  Mean angle: {np.mean(angles):.2f}°")
+    print(f"  Circular mean: {circular_mean:.2f}°")
     print(f"  Std deviation: {np.std(angles):.2f}°")
     print(f"  Min angle: {np.min(angles):.2f}°")
     print(f"  Max angle: {np.max(angles):.2f}°")
+    
+    print("[Statistics - Raw Angles]")
+    print(f"  Std deviation: {np.std(angles_raw):.2f}°")
+    
+    print("[VAD Statistics]")
+    vad_ratio = sum(vad_flags) / len(vad_flags) * 100
+    print(f"  Speech frames: {sum(vad_flags)}/{len(vad_flags)} ({vad_ratio:.1f}%)")
     print("=" * 60)
     
     # Visualization

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class RawAudioSSLNet(nn.Module):
     """
@@ -57,7 +58,9 @@ class RawAudioSSLNet(nn.Module):
         x = x.mean(dim=-1)  # BxDxT -> BxD
 
         out = self.predict(x)
+        out = torch.nn.functional.normalize(out, p=2, dim=1)
         return out
+
 
 # class RawAudioSSLNet(nn.Module):
 #     """
@@ -118,7 +121,77 @@ class RawAudioSSLNet(nn.Module):
 #         x = self.layer5(x)
 #         x = self.gap(x).flatten(1)
 #         out = self.classifier(x)
+#         out = torch.nn.functional.normalize(out, p=2, dim=1)
 #         return out
+
+# class DownBlock2xS2(nn.Module):
+#     """A block with two stride=2 convolutions (total 4x downsampling), DV500-friendly: Conv + ReLU"""
+#     def __init__(self, in_c: int, out_c: int, k: int = 5):
+#         super().__init__()
+#         p = k // 2
+#         self.net = nn.Sequential(
+#             nn.Conv2d(in_c, out_c, kernel_size=(1, k), stride=(1, 2), padding=(0, p)),
+#             nn.BatchNorm2d(out_c),
+#             nn.ReLU(inplace=True),
+
+#             nn.Conv2d(out_c, out_c, kernel_size=(1, k), stride=(1, 2), padding=(0, p)),
+#             nn.BatchNorm2d(out_c),
+#             nn.ReLU(inplace=True),
+#         )
+
+#     def forward(self, x):
+#         return self.net(x)
+
+
+# class RawAudioSSLNet(nn.Module):
+#     """
+#     DV500 optimized version: two blocks (block1/block2), each with two stride=2 convolutions
+#     Input:  (B, M, T)
+#     Internal: (B, M, 1, T)
+#     Output: (B, 2) -> [sin, cos]
+#     """
+#     def __init__(self, num_mics: int = 4, k_stem: int = 15, k: int = 5, input_len: int = 2048):
+#         super().__init__()
+#         C = 16
+#         p_stem = k_stem // 2
+
+#         # stem：建议 stride=1（保相位细节），下采样交给 block 内的两次 stride=2
+#         self.stem = nn.Sequential(
+#             nn.Conv2d(num_mics, C, kernel_size=(1, k_stem), stride=(1, 1), padding=(0, p_stem)),
+#             nn.BatchNorm2d(C),
+#             nn.ReLU(inplace=True),
+#         )
+
+#         # 两个 block：每个 block 内部两次 stride=2（总 /16）
+#         self.block1 = DownBlock2xS2(C,   2*C, k=k)  # T -> T/4
+#         self.block2 = DownBlock2xS2(2*C, 4*C, k=k)  # T -> T/16
+#         # self.block3 = DownBlock2xS2(4*C, 8*C, k=k)  # T -> T/64
+#         # GAP + 极简 head
+#         # self.fc = nn.Linear(4*C, 2)
+
+#         # 输出层: 预测 [sin, cos]
+#         self.predict = nn.Sequential(
+#             nn.Linear(4*C, 4*C),  # Fix missing comma here
+#             nn.ReLU(inplace=True),
+#             # nn.Dropout(0.2),
+#             nn.Linear(4*C, 2)  # [sin_val, cos_val]
+#         )
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # (B,M,T) -> (B,M,1,T)
+#         x = x.unsqueeze(2)
+
+#         x = self.stem(x)
+#         x = self.block1(x)
+#         x = self.block2(x)
+#         # x = self.block3(x)
+#         # (B,C,1,T') -> (B,C)
+#         x = x.mean(dim=-1).squeeze(-1)
+#         out = self.predict(x)
+#         return F.normalize(out, p=2, dim=1)
+
+
+
 
 # # ==========================================
 # # 1. 粘贴或导入 Model 定义 (RawAudioSSLNet)
