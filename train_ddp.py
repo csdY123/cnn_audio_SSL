@@ -66,10 +66,10 @@ def main():
     AUDIO_DIR = "./speech_data/LibriSpeech/dev-clean"
     # 注意：DDP模式下，BATCH_SIZE 是指"每张卡"的大小
     # 如果你有8张卡，总 BatchSize = 256 * 8 = 2048
-    BATCH_SIZE = 64 
-    LR = 0.001  # 学习率通常随总 BatchSize 线性缩放
-    EPOCHS = 500
-    SAVE_DIR = "saved_middle_ddp_3"
+    BATCH_SIZE = 128 
+    LR = 0.0005  # 学习率通常随总 BatchSize 线性缩放
+    EPOCHS = 2000
+    SAVE_DIR = "saved_middle_ddp_3_after_500steps_addrealnoise"
     
     if is_main_process():
         os.makedirs(SAVE_DIR, exist_ok=True)
@@ -107,7 +107,7 @@ def main():
     model = RawAudioSSLNet()
     
     # # 如果有预训练权重，建议在 wrap DDP 之前加载
-    pretrained_path = "/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_middle_ddp/ssl_model_ddp_340.pth"
+    pretrained_path = "/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_middle_ddp/ssl_model_ddp_345.pth"
     if os.path.exists(pretrained_path):
         state_dict = torch.load(pretrained_path, map_location='cpu')
         model.load_state_dict(state_dict)
@@ -123,9 +123,9 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     
     # 学习率调度
-    LR_START = 1e-3  # 同样缩放起始学习率
+    LR_START = 5e-4  # 同样缩放起始学习率
     LR_END = 1e-4 
-    LR_DECAY_EPOCHS = 500
+    LR_DECAY_EPOCHS = 2000
     
     def lr_lambda(epoch):
         if epoch < LR_DECAY_EPOCHS:

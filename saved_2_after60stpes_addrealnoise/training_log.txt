@@ -1,0 +1,14 @@
+Epoch 0 | Time: 190.3s | MSE Loss: 0.2920 | Acc (±15°): 47.82% | LR: 0.001000
+Epoch 1 | Time: 197.3s | MSE Loss: 0.2675 | Acc (±15°): 50.06% | LR: 0.000991
+Epoch 0 | Time: 193.5s | MSE Loss: 0.2595 | Acc (±15°): 50.55% | LR: 0.001000
+Epoch 1 | Time: 198.8s | MSE Loss: 0.2526 | Acc (±15°): 51.30% | LR: 0.000991
+Epoch 2 | Time: 202.2s | MSE Loss: 0.2504 | Acc (±15°): 52.12% | LR: 0.000982
+Epoch 3 | Time: 201.8s | MSE Loss: 0.2481 | Acc (±15°): 51.68% | LR: 0.000973
+Epoch 4 | Time: 187.7s | MSE Loss: 0.2434 | Acc (±15°): 51.05% | LR: 0.000964
+Epoch 5 | Time: 178.8s | MSE Loss: 0.2361 | Acc (±15°): 53.76% | LR: 0.000955
+Epoch 0 | Time: 185.7s | MSE Loss: 0.2549 | Acc (±15°): 52.22% | LR: 0.001000
+Epoch 1 | Time: 187.1s | MSE Loss: 0.2491 | Acc (±15°): 51.22% | LR: 0.000991
+Epoch 2 | Time: 183.5s | MSE Loss: 0.2403 | Acc (±15°): 53.31% | LR: 0.000982
+Epoch 3 | Time: 178.7s | MSE Loss: 0.2430 | Acc (±15°): 53.31% | LR: 0.000973
+Epoch 4 | Time: 182.8s | MSE Loss: 0.2466 | Acc (±15°): 53.12% | LR: 0.000964
+Epoch 5 | Time: 187.8s | MSE Loss: 0.2831 | Acc (±15°): 46.92% | LR: 0.000955

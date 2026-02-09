@@ -12,10 +12,32 @@ import random
 
 class DynamicRoomSimulator(Dataset):
     def __init__(self, audio_source_dir, sample_length=2048, epoch_length=2000,
-                 noise_dir="/mnt/chensenda/codes/sound/denoisy/datasets/DNS-Challenge/datasets/noise"):
+                 noise_dir="/mnt/chensenda/codes/sound/denoisy/datasets/DNS-Challenge/datasets/noise",
+                 crops_per_simulation=8, simulation_duration_sec=1.5):
+        """
+        Args:
+            audio_source_dir: Directory containing speech source files
+            sample_length: Length of each output sample (default 2048)
+            epoch_length: Number of samples per epoch
+            noise_dir: Directory containing noise files for augmentation
+            crops_per_simulation: Number of crops to extract per room simulation (default 6)
+            simulation_duration_sec: Duration of source audio for simulation (default 1.5s)
+        """
         self.sample_length = sample_length
         self.epoch_length = epoch_length
         self.fs = 16000
+        
+        # -------------------------------------------------------------
+        # Multi-Crop Configuration: One simulation -> Multiple samples
+        # This amortizes the expensive room.simulate() across N crops
+        # -------------------------------------------------------------
+        self.crops_per_simulation = crops_per_simulation
+        self.simulation_duration_sec = simulation_duration_sec
+        
+        # Crop cache: In multiprocessing mode (num_workers > 0), each worker
+        # process gets its own copy of the Dataset object, so this list is
+        # naturally isolated between processes. No threading.local needed!
+        self.crop_cache = []
         
         # -------------------------------------------------------------
         # 1. Load speech source files (supports .wav and .flac)
@@ -77,6 +99,8 @@ class DynamicRoomSimulator(Dataset):
             [-0.1035, -0.0235, 0.0], # mic2
             [-0.1035,  0.0235, 0.0], # mic3
         ]).T # Transpose to 3x4
+        
+        print(f"[DynamicRoomSimulator] Multi-Crop enabled: {crops_per_simulation} crops per {simulation_duration_sec}s simulation")
 
     def __len__(self):
         return self.epoch_length
@@ -221,6 +245,292 @@ class DynamicRoomSimulator(Dataset):
             noise_y = noise_y / max_val
         
         return noise_y.astype(np.float32)
+    
+    def _apply_additive_noise(self, simulated_audio: np.ndarray) -> np.ndarray:
+        """
+        Apply additive noise to simulated audio with proper multi-channel decorrelation.
+        This is extracted as a separate method so each crop can have different noise.
+        
+        Improved decorrelation strategy:
+        - Each channel gets noise from a DIFFERENT random position in the noise file
+        - This drastically reduces inter-channel correlation (from ~0.99 to ~0.3)
+        - More realistic simulation of diffuse noise field
+        
+        Args:
+            simulated_audio: Shape (4, N), the room-simulated audio
+        
+        Returns:
+            Noisy audio with same shape
+        """
+        audio = simulated_audio.copy()
+        
+        # Random SNR: 5dB (very noisy) - 25dB (quiet)
+        target_snr_db = np.random.uniform(5.0, 25.0)
+        
+        sig_power = np.mean(audio ** 2)
+        if sig_power > 0:
+            if len(self.noise_cache) > 0:
+                signal_len = audio.shape[1]
+                noise_multichannel = np.zeros_like(audio)
+                
+                # IMPROVED: Each channel gets independently sampled noise
+                # This creates much lower inter-channel correlation
+                for ch in range(4):
+                    # Randomly select a noise clip for this channel
+                    noise_y = random.choice(self.noise_cache)
+                    
+                    # Extract from DIFFERENT random position for each channel
+                    if len(noise_y) < signal_len:
+                        # Wrap-around for short clips
+                        noise_ch = np.pad(noise_y, (0, signal_len - len(noise_y)), mode='wrap')
+                    else:
+                        # Each channel gets a different random crop position
+                        max_start = len(noise_y) - signal_len
+                        start_idx = np.random.randint(0, max_start + 1)
+                        noise_ch = noise_y[start_idx:start_idx + signal_len]
+                    
+                    # Small gain variation per channel (physically realistic)
+                    noise_multichannel[ch, :] = noise_ch * np.random.uniform(0.85, 1.15)
+                
+                # Add small physically-realistic delay (0-10 samples for ~20cm mic spacing)
+                # This is optional but adds realism without destroying decorrelation
+                for ch in range(4):
+                    delay = np.random.randint(0, 10)
+                    noise_multichannel[ch, :] = np.roll(noise_multichannel[ch, :], shift=delay)
+                
+                noise_power = np.mean(noise_multichannel ** 2)
+                if noise_power > 0:
+                    scale = np.sqrt(sig_power / (noise_power * 10**(target_snr_db/10)))
+                    audio = audio + noise_multichannel * scale
+            else:
+                # Fallback: Independent Gaussian white noise per channel
+                # This naturally has zero inter-channel correlation
+                noise_power = sig_power / (10 ** (target_snr_db / 10))
+                noise = np.random.normal(0, np.sqrt(noise_power), audio.shape)
+                audio = audio + noise
+        
+        return audio
+    
+    def _apply_channel_gain_and_normalize(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Apply channel gain perturbation and normalize.
+        Each crop gets different gain perturbation for diversity.
+        
+        Args:
+            audio: Shape (4, N)
+        
+        Returns:
+            Processed audio with same shape
+        """
+        # Channel gain perturbation (~±3dB)
+        gain_perturb = np.random.uniform(0.7, 1.3, size=(4, 1))
+        audio = audio * gain_perturb
+        
+        # Normalize (preserve ILD, avoid division by zero)
+        max_amp = np.max(np.abs(audio))
+        if max_amp > 0:
+            audio = audio / max_amp * 0.9
+        
+        return audio
+    
+    def _extract_random_crop(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Extract a random crop of sample_length from audio.
+        Includes silent-crop protection.
+        
+        Args:
+            audio: Shape (4, N), the full simulated audio
+        
+        Returns:
+            Cropped audio of shape (4, sample_length)
+        """
+        signal_len = audio.shape[1]
+        
+        if signal_len > self.sample_length:
+            max_start = signal_len - self.sample_length
+            
+            # Silent crop protection: try 3 times
+            for _ in range(3):
+                start = np.random.randint(0, max_start + 1)
+                cropped = audio[:, start : start + self.sample_length]
+                
+                # Energy threshold check
+                if np.mean(cropped**2) > 1e-5:
+                    return cropped
+            
+            # Fallback: take center crop
+            start = max_start // 2
+            return audio[:, start : start + self.sample_length]
+        else:
+            # Pad if too short
+            pad_width = self.sample_length - signal_len
+            return np.pad(audio, ((0, 0), (0, pad_width)))
+    
+    def _run_simulation_and_fill_cache(self):
+        """
+        Run ONE room simulation and fill the cache with MULTIPLE crops.
+        This is the key optimization: expensive simulate() is amortized across N crops.
+        
+        Each crop gets:
+        - Same room impulse response (RIR) and source direction
+        - DIFFERENT random additive noise (SNR, noise type)
+        - DIFFERENT channel gain perturbation
+        - DIFFERENT random crop position in time
+        
+        Returns:
+            List of (audio_tensor, label_tensor) tuples
+        """
+        # -----------------------------------------------------------
+        # 1. Setup room (same as before)
+        # -----------------------------------------------------------
+        room_dim, e_absorption, max_order = self._get_random_room_params()
+        
+        room = pra.ShoeBox(
+            room_dim, 
+            fs=self.fs, 
+            materials=pra.Material(e_absorption), 
+            max_order=max_order
+        )
+
+        # -----------------------------------------------------------
+        # 2. Place microphone array
+        # -----------------------------------------------------------
+        mic_center = np.array([
+            np.random.uniform(0.5, room_dim[0] - 0.5),
+            np.random.uniform(0.5, room_dim[1] - 0.5),
+            np.random.uniform(0.5, room_dim[2] - 0.5) 
+        ])
+        
+        current_mic_locs = self.mic_positions_local + mic_center.reshape(3, 1)
+        room.add_microphone_array(current_mic_locs)
+
+        # -----------------------------------------------------------
+        # 3. Place source (random angle + distance)
+        # -----------------------------------------------------------
+        angle_deg = np.random.randint(0, 360)
+        angle_rad = np.deg2rad(angle_deg)
+        dist = np.random.uniform(0.5, 5.0)
+        
+        src_x = mic_center[0] + dist * np.cos(angle_rad)
+        src_y = mic_center[1] + dist * np.sin(angle_rad)
+        src_z = mic_center[2] + np.random.uniform(-0.2, 1.5)
+        
+        # Ray scaling to keep source inside room
+        x_min, x_max = 0.1, room_dim[0] - 0.1
+        y_min, y_max = 0.1, room_dim[1] - 0.1
+        z_min, z_max = 0.1, room_dim[2] - 0.1
+
+        dx = src_x - mic_center[0]
+        dy = src_y - mic_center[1]
+        dz = src_z - mic_center[2]
+
+        scale = 1.0
+        if dx != 0:
+            if src_x > x_max: scale = min(scale, (x_max - mic_center[0]) / dx)
+            if src_x < x_min: scale = min(scale, (x_min - mic_center[0]) / dx)
+        if dy != 0:
+            if src_y > y_max: scale = min(scale, (y_max - mic_center[1]) / dy)
+            if src_y < y_min: scale = min(scale, (y_min - mic_center[1]) / dy)
+        if dz != 0:
+            if src_z > z_max: scale = min(scale, (z_max - mic_center[2]) / dz)
+            if src_z < z_min: scale = min(scale, (z_min - mic_center[2]) / dz)
+        scale = max(1e-4, min(scale, 1.0))
+
+        src_x = mic_center[0] + dx * scale
+        src_y = mic_center[1] + dy * scale
+        src_z = mic_center[2] + dz * scale
+
+        # Calculate final angle label
+        real_dx = src_x - mic_center[0]
+        real_dy = src_y - mic_center[1]
+        real_angle_rad = np.arctan2(real_dy, real_dx)
+        if real_angle_rad < 0: 
+            real_angle_rad += 2 * np.pi
+        label_deg = int(np.degrees(real_angle_rad)) % 360
+        
+        # -----------------------------------------------------------
+        # 4. Load LONGER source clip for multi-crop
+        # -----------------------------------------------------------
+        source_signal = self._load_random_source_clip(duration_sec=self.simulation_duration_sec)
+        
+        # Spectral augmentation (applied once to source)
+        if np.random.random() < 0.8:
+            low_cut = np.random.uniform(50, 200)
+            high_cut = np.random.uniform(4000, 7500)
+            try:
+                sos = signal.butter(2, [low_cut, high_cut], btype='band', fs=self.fs, output='sos')
+                source_signal = signal.sosfilt(sos, source_signal)
+            except Exception:
+                pass
+        
+        room.add_source([src_x, src_y, src_z], signal=source_signal)
+
+        # -----------------------------------------------------------
+        # 5. Point source noise (30% probability)
+        # -----------------------------------------------------------
+        if np.random.random() < 0.3 and len(self.noise_cache) > 0:
+            noise_angle_deg = (angle_deg + np.random.randint(30, 330)) % 360
+            noise_angle_rad = np.deg2rad(noise_angle_deg)
+            noise_dist = np.random.uniform(0.5, 3.0)
+            
+            noise_x = mic_center[0] + noise_dist * np.cos(noise_angle_rad)
+            noise_y = mic_center[1] + noise_dist * np.sin(noise_angle_rad)
+            noise_z = mic_center[2] + np.random.uniform(-0.2, 1.0)
+            
+            # Boundary scaling for noise source
+            ndx = noise_x - mic_center[0]
+            ndy = noise_y - mic_center[1]
+            ndz = noise_z - mic_center[2]
+            
+            nscale = 1.0
+            if ndx != 0:
+                if noise_x > x_max: nscale = min(nscale, (x_max - mic_center[0]) / ndx)
+                if noise_x < x_min: nscale = min(nscale, (x_min - mic_center[0]) / ndx)
+            if ndy != 0:
+                if noise_y > y_max: nscale = min(nscale, (y_max - mic_center[1]) / ndy)
+                if noise_y < y_min: nscale = min(nscale, (y_min - mic_center[1]) / ndy)
+            if ndz != 0:
+                if noise_z > z_max: nscale = min(nscale, (z_max - mic_center[2]) / ndz)
+                if noise_z < z_min: nscale = min(nscale, (z_min - mic_center[2]) / ndz)
+            nscale = max(1e-4, min(nscale, 1.0))
+            
+            noise_x = mic_center[0] + ndx * nscale
+            noise_y = mic_center[1] + ndy * nscale
+            noise_z = mic_center[2] + ndz * nscale
+            
+            noise_signal = self._load_random_noise_clip(len(source_signal))
+            interference_gain = np.random.uniform(0.0, 0.5)
+            noise_signal = noise_signal * interference_gain
+            
+            # room.add_source([noise_x, noise_y, noise_z], signal=noise_signal)
+
+        # -----------------------------------------------------------
+        # 6. Run EXPENSIVE simulation ONCE
+        # -----------------------------------------------------------
+        room.simulate()
+        simulated_audio = room.mic_array.signals  # Shape: (4, N)
+
+        # -----------------------------------------------------------
+        # 7. Generate MULTIPLE crops from this simulation
+        # Each crop has DIFFERENT noise, gain, and crop position
+        # -----------------------------------------------------------
+        crops = []
+        label_tensor = torch.tensor(label_deg, dtype=torch.long)
+        
+        for _ in range(self.crops_per_simulation):
+            # Each crop gets independent noise
+            noisy_audio = self._apply_additive_noise(simulated_audio)
+            
+            # Each crop gets independent gain perturbation
+            processed_audio = self._apply_channel_gain_and_normalize(noisy_audio)
+            
+            # Each crop gets different random position
+            cropped = self._extract_random_crop(processed_audio)
+            
+            audio_tensor = torch.from_numpy(cropped.astype(np.float32))
+            crops.append((audio_tensor, label_tensor))
+        
+        return crops
 
     def _load_random_source_clip(self, duration_sec=1.0):
         # Keep trying until we get a valid (non-empty) audio clip
@@ -256,279 +566,24 @@ class DynamicRoomSimulator(Dataset):
         return y
 
     def __getitem__(self, idx):
-        # -----------------------------------------------------------
-        # 1. 准备环境 (随机房间参数)
-        # -----------------------------------------------------------
-        room_dim, e_absorption, max_order = self._get_random_room_params()
+        """
+        Get a single training sample.
         
-        # 创建房间
-        room = pra.ShoeBox(
-            room_dim, 
-            fs=self.fs, 
-            materials=pra.Material(e_absorption), 
-            max_order=max_order
-        )
-
-        # -----------------------------------------------------------
-        # 2. 放置麦克风 (随机位置)
-        # -----------------------------------------------------------
-        # 保证阵列离墙至少 0.5米
-        mic_center = np.array([
-            np.random.uniform(0.5, room_dim[0] - 0.5),
-            np.random.uniform(0.5, room_dim[1] - 0.5),
-            np.random.uniform(0.5, room_dim[2] - 0.5) 
-        ])
+        Multi-Crop Strategy:
+        - If cache is empty: run ONE simulation, generate N crops, fill cache
+        - Return one crop from cache
         
-        current_mic_locs = self.mic_positions_local + mic_center.reshape(3, 1)
-        room.add_microphone_array(current_mic_locs)
-
-        # -----------------------------------------------------------
-        # 3. 放置声源 (随机角度 + 扩大距离 + 高度扰动)
-        # -----------------------------------------------------------
-        angle_deg = np.random.randint(0, 360)
-        angle_rad = np.deg2rad(angle_deg)
+        This amortizes the expensive room.simulate() cost across N samples.
         
-        # 🔥【改进1】扩大距离范围：0.5m (近场) 到 5.0m (远场)
-        dist = np.random.uniform(0.5, 5.0)
+        Note: In PyTorch DataLoader with num_workers > 0, each worker process
+        gets its own copy of the Dataset object. So self.crop_cache is naturally
+        isolated between processes - no threading.local() or locks needed!
+        """
+        # If cache is empty, run simulation and fill it
+        if not self.crop_cache:
+            new_crops = self._run_simulation_and_fill_cache()
+            random.shuffle(new_crops)
+            self.crop_cache.extend(new_crops)
         
-        src_x = mic_center[0] + dist * np.cos(angle_rad)
-        src_y = mic_center[1] + dist * np.sin(angle_rad)
-        
-        # 🔥【安全补丁 A】高度随机扰动 (Z-axis Jitter)
-        src_z = mic_center[2] + np.random.uniform(-0.2, 1.5)
-        
-        # -----------------------------------------------------------
-        # [Fix] Ray Scaling instead of Hard Clip
-        # Preserves angle (Direction), only scales distance
-        # This prevents "Corner Magnetism" bias in angle distribution
-        # -----------------------------------------------------------
-        
-        # 1. Define room boundaries (with 0.1m margin)
-        x_min, x_max = 0.1, room_dim[0] - 0.1
-        y_min, y_max = 0.1, room_dim[1] - 0.1
-        z_min, z_max = 0.1, room_dim[2] - 0.1
-
-        # 2. Calculate displacement vector from mic center
-        dx = src_x - mic_center[0]
-        dy = src_y - mic_center[1]
-        dz = src_z - mic_center[2]
-
-        # 3. Calculate scaling factor for each axis
-        # If point is inside boundary, factor = 1.0; if outside, factor < 1.0
-        scale = 1.0
-        
-        # X-axis boundary check
-        if dx != 0:
-            if src_x > x_max: 
-                scale = min(scale, (x_max - mic_center[0]) / dx)
-            if src_x < x_min: 
-                scale = min(scale, (x_min - mic_center[0]) / dx)
-        
-        # Y-axis boundary check
-        if dy != 0:
-            if src_y > y_max: 
-                scale = min(scale, (y_max - mic_center[1]) / dy)
-            if src_y < y_min: 
-                scale = min(scale, (y_min - mic_center[1]) / dy)
-        
-        # Z-axis boundary check (doesn't affect horizontal angle, but for physical correctness)
-        if dz != 0:
-            if src_z > z_max: 
-                scale = min(scale, (z_max - mic_center[2]) / dz)
-            if src_z < z_min: 
-                scale = min(scale, (z_min - mic_center[2]) / dz)
-
-        # Ensure scale is positive and reasonable
-        # Only use min(scale, 1.0) to strictly respect wall boundaries
-        # Use 1e-4 as floor to prevent negative scale from floating point errors
-        scale = max(1e-4, min(scale, 1.0))
-
-        # 4. Apply scaling to get final coordinates
-        # Source is now guaranteed inside room, angle is preserved
-        src_x = mic_center[0] + dx * scale
-        src_y = mic_center[1] + dy * scale
-        src_z = mic_center[2] + dz * scale
-
-        # 5. Calculate final angle (should be same as original angle_deg, 
-        #    but recalculate for floating point safety)
-        real_dx = src_x - mic_center[0]
-        real_dy = src_y - mic_center[1]
-        real_angle_rad = np.arctan2(real_dy, real_dx)
-        if real_angle_rad < 0: 
-            real_angle_rad += 2 * np.pi
-        
-        # Final Label (0-359), add %360 to handle edge case
-        label_deg = int(np.degrees(real_angle_rad)) % 360
-        
-        # Read random speech clip (0.5 seconds)
-        source_signal = self._load_random_source_clip(duration_sec=0.5)
-        
-        # -----------------------------------------------------------
-        # [Improvement 3] Spectral Augmentation via Random Bandpass Filter
-        # Simulates high-frequency attenuation in real far-field recordings
-        # and removes extreme low frequencies that may not be present
-        # -----------------------------------------------------------
-        if np.random.random() < 0.8:  # 80% probability to apply filter
-            low_cut = np.random.uniform(50, 200)    # Random low cutoff: 50-200 Hz
-            high_cut = np.random.uniform(4000, 7500)  # Random high cutoff: 3k-7k Hz
-            try:
-                sos = signal.butter(2, [low_cut, high_cut], btype='band', fs=self.fs, output='sos')
-                source_signal = signal.sosfilt(sos, source_signal)
-            except Exception:
-                pass  # Skip filtering if parameters are invalid
-        
-        room.add_source([src_x, src_y, src_z], signal=source_signal)
-
-        # -----------------------------------------------------------
-        # [Improvement 5] Point Source Noise (Interfering Speaker / TV)
-        # With 30% probability, add a directional noise source
-        # This simulates realistic scenarios like another person talking nearby
-        # The noise will have proper TDOA (phase differences) across microphones
-        # -----------------------------------------------------------
-        if np.random.random() < 0.3 and len(self.noise_cache) > 0:
-            # Random angle for interference source (different from target)
-            # Ensure at least 30 degrees separation from target source
-            noise_angle_deg = (angle_deg + np.random.randint(30, 330)) % 360
-            noise_angle_rad = np.deg2rad(noise_angle_deg)
-            
-            # Random distance for interference (typically closer for indoor scenarios)
-            noise_dist = np.random.uniform(0.5, 3.0)
-            
-            # Calculate interference source position
-            noise_x = mic_center[0] + noise_dist * np.cos(noise_angle_rad)
-            noise_y = mic_center[1] + noise_dist * np.sin(noise_angle_rad)
-            noise_z = mic_center[2] + np.random.uniform(-0.2, 1.0)
-            
-            # Apply same boundary scaling as target source
-            ndx = noise_x - mic_center[0]
-            ndy = noise_y - mic_center[1]
-            ndz = noise_z - mic_center[2]
-            
-            nscale = 1.0
-            if ndx != 0:
-                if noise_x > x_max: nscale = min(nscale, (x_max - mic_center[0]) / ndx)
-                if noise_x < x_min: nscale = min(nscale, (x_min - mic_center[0]) / ndx)
-            if ndy != 0:
-                if noise_y > y_max: nscale = min(nscale, (y_max - mic_center[1]) / ndy)
-                if noise_y < y_min: nscale = min(nscale, (y_min - mic_center[1]) / ndy)
-            if ndz != 0:
-                if noise_z > z_max: nscale = min(nscale, (z_max - mic_center[2]) / ndz)
-                if noise_z < z_min: nscale = min(nscale, (z_min - mic_center[2]) / ndz)
-            nscale = max(1e-4, min(nscale, 1.0))
-            
-            noise_x = mic_center[0] + ndx * nscale
-            noise_y = mic_center[1] + ndy * nscale
-            noise_z = mic_center[2] + ndz * nscale
-            
-            # Load noise signal with same length as source signal
-            noise_signal = self._load_random_noise_clip(len(source_signal))
-            
-            # Random gain for interference: 0.3x to 1.0x of target signal level
-            # (interference should typically be weaker than target)
-            interference_gain = np.random.uniform(0.0, 0.5)
-            noise_signal = noise_signal * interference_gain
-            
-            room.add_source([noise_x, noise_y, noise_z], signal=noise_signal)
-
-        # -----------------------------------------------------------
-        # 4. 运行物理仿真
-        # -----------------------------------------------------------
-        room.simulate()
-        simulated_audio = room.mic_array.signals # Shape: (4, N)
-
-        # -----------------------------------------------------------
-        # [Improvement 1] Real Noise Injection instead of Gaussian noise
-        # Uses pre-cached noise for fast training (no I/O in __getitem__)
-        # -----------------------------------------------------------
-        # Random SNR: 0dB (very noisy) - 25dB (quiet), expanded range for robustness
-        target_snr_db = np.random.uniform(5.0, 25.0)
-        
-        sig_power = np.mean(simulated_audio ** 2)
-        if sig_power > 0:
-            if len(self.noise_cache) > 0:
-                # Use pre-cached real noise (no I/O overhead!)
-                noise_y = random.choice(self.noise_cache).copy()
-                
-                # Pad or truncate noise to match signal length
-                signal_len = simulated_audio.shape[1]
-                if len(noise_y) < signal_len:
-                    # Wrap-around padding for short noise clips
-                    noise_y = np.pad(noise_y, (0, signal_len - len(noise_y)), mode='wrap')
-                else:
-                    # Random crop for long noise clips
-                    max_start = len(noise_y) - signal_len
-                    start_idx = np.random.randint(0, max_start + 1) if max_start > 0 else 0
-                    noise_y = noise_y[start_idx:start_idx + signal_len]
-                
-                # Expand single-channel noise to multi-channel (simulate diffuse field)
-                # Use np.roll for circular shift to avoid silent gaps at the beginning
-                noise_multichannel = np.zeros_like(simulated_audio)
-                for ch in range(4):
-                    # Random delay: 0-20 samples for physically realistic diffuse field
-                    # Physical basis: mic spacing ~20cm -> max delay ~10 samples @16kHz
-                    # Using 0-20 samples allows some extra decorrelation margin
-                    # (Previous 0-100 samples was physically unrealistic)
-                    delay = np.random.randint(0, 20)
-                    # Use np.roll for circular shift (no data loss, no silent gaps)
-                    noise_multichannel[ch, :] = np.roll(noise_y, shift=delay)
-                    
-                    # Also add small random gain per channel for diffuse field
-                    noise_multichannel[ch] *= np.random.uniform(0.8, 1.2)
-                
-                noise_power = np.mean(noise_multichannel ** 2)
-                if noise_power > 0:
-                    scale = np.sqrt(sig_power / (noise_power * 10**(target_snr_db/10)))
-                    simulated_audio = simulated_audio + noise_multichannel * scale
-            else:
-                # Fallback: Gaussian white noise (less realistic but better than nothing)
-                noise_power = sig_power / (10 ** (target_snr_db / 10))
-                noise = np.random.normal(0, np.sqrt(noise_power), simulated_audio.shape)
-                simulated_audio = simulated_audio + noise
-        
-        # -----------------------------------------------------------
-        # [Improvement 2] Channel Gain Perturbation
-        # Simulates real-world microphone sensitivity mismatch (±1-3 dB)
-        # This prevents the model from over-relying on amplitude differences
-        # -----------------------------------------------------------
-        gain_perturb = np.random.uniform(0.7, 1.3, size=(4, 1))  # ~±3dB
-        simulated_audio = simulated_audio * gain_perturb
-
-        # -----------------------------------------------------------
-        # 5. 后处理与随机裁剪 (含静音防御)
-        # -----------------------------------------------------------
-        # 归一化 (保留 ILD, 避免除零)
-        max_amp = np.max(np.abs(simulated_audio))
-        if max_amp > 0:
-            simulated_audio = simulated_audio / max_amp * 0.9
-        
-        signal_len = simulated_audio.shape[1]
-        
-        if signal_len > self.sample_length:
-            max_start = signal_len - self.sample_length
-            
-            # 🔥【安全补丁 B】静音切片防御 (Silent Crop Protection)
-            # 尝试 3 次随机切片，确保切到的片段有足够的能量
-            for _ in range(3):
-                start = np.random.randint(0, max_start + 1)
-                cropped = simulated_audio[:, start : start + self.sample_length]
-                
-                # 能量阈值检测 (1e-5 是经验值)
-                if np.mean(cropped**2) > 1e-5:
-                    break
-            else:
-                # 如果3次都失败(极罕见)，兜底方案：取正中间
-                start = max_start // 2
-                cropped = simulated_audio[:, start : start + self.sample_length]
-                
-        else:
-            # 补零 (Padding)
-            pad_width = self.sample_length - signal_len
-            cropped = np.pad(simulated_audio, ((0,0), (0, pad_width)))
-
-        # 转 Tensor
-        audio_tensor = torch.from_numpy(cropped.astype(np.float32))
-        
-        # 返回角度 Label
-        label_tensor = torch.tensor(label_deg, dtype=torch.long) 
-
-        return audio_tensor, label_tensor
+        # Pop one sample from cache and return
+        return self.crop_cache.pop()

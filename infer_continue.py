@@ -766,7 +766,7 @@ Examples:
     parser.add_argument(
         '--model', '-m',
         type=str,
-        default='/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_middle_ddp/ssl_model_ddp_345.pth',
+        default='/mnt/chensenda/codes/sound/cnn_audio_SSL/saved_middle_ddp_after_345_GPU3_after500steps_addrealnoise/ssl_model_ddp_1980.pth',
         help='Model weights file path'
     )
     

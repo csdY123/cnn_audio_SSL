@@ -2,3 +2,4 @@
 *.csv
 /speech_data
 /__pycache__
+/test_samples

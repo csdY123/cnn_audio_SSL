@@ -1,0 +1,6 @@
+Epoch 0 | Time: 287.4s | MSE Loss: 0.5596 | Acc (±15°): 18.59% | LR: 0.000998
+Epoch 1 | Time: 276.1s | MSE Loss: 0.3491 | Acc (±15°): 34.69% | LR: 0.000996
+Epoch 2 | Time: 296.1s | MSE Loss: 0.3364 | Acc (±15°): 37.37% | LR: 0.000995
+Epoch 3 | Time: 291.1s | MSE Loss: 0.3140 | Acc (±15°): 39.70% | LR: 0.000993
+Epoch 4 | Time: 292.4s | MSE Loss: 0.3183 | Acc (±15°): 40.03% | LR: 0.000991
+Epoch 5 | Time: 298.7s | MSE Loss: 0.3185 | Acc (±15°): 40.42% | LR: 0.000989
