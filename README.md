@@ -1,6 +1,9 @@
 ## Train
 python trainer.py
 
+## evaluate
+python evaluate.py quadrilateral_mic_dataset
+
 ## Inference
 python infer_continue.py /mnt/chensenda/codes/sound/uniubi/0/audio_chn2.pcm /mnt/chensenda/codes/sound/uniubi/0/audio_chn3.pcm /mnt/chensenda/codes/sound/uniubi/0/audio_chn0.pcm /mnt/chensenda/codes/sound/uniubi/0/audio_chn1.pcm --save ./
 
